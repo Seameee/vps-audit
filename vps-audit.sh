@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
-VPS_AUDIT_VERSION="0.3.0"
+VPS_AUDIT_VERSION="0.3.1"
 
 # ------------------------------------------------------------------
+# v0.3.1: fix port scan with `ss -tuln` (Netid column shifts fields by
+#         one when tcp+udp are combined); trim stray commas in fail2ban
+#         and UFW messages; whitelist ssh-keysign as a known SUID helper.
 # v0.3.0 changes (driven by real-world audits on two VPS):
 #   1. SUID check: find now uses -xdev and prunes container/virtual
 #      dirs. The old `find /` hung for hours on FUSE cloud mounts
@@ -283,7 +286,7 @@ check_firewall_status() {
     if command -v ufw >/dev/null 2>&1; then
         if ufw status | grep -qw "active"; then
             local policy
-            policy=$(ufw status verbose 2>/dev/null | awk '/^Default:/{print $2, $3}')
+            policy=$(ufw status verbose 2>/dev/null | awk '/^Default:/{sub(/,$/,"",$3); print $2, $3}')
             check_security "Firewall Status (UFW)" "PASS" "UFW firewall is active (default: $policy)"
         else
             check_security "Firewall Status (UFW)" "FAIL" "UFW is installed but not active - your system is exposed to network attacks"
@@ -441,6 +444,7 @@ check_fail2ban_port_alignment() {
     if [ -z "$real_ports" ]; then
         real_ports=$(echo "$SSH_PORTS" | tr ' ' '\n' | sort -nu | tr '\n' ' ')
     fi
+    real_ports=$(echo "$real_ports" | xargs)  # trim stray whitespace
     if [ -z "$real_ports" ]; then
         check_security "Fail2ban Port Alignment" "WARN" "Could not determine the ports sshd listens on - verify the fail2ban jail port manually"
         return
@@ -536,7 +540,9 @@ LISTEN_LINES=""
 PORT_TOOLS_OK=0
 if command -v ss >/dev/null 2>&1; then
     PORT_TOOLS_OK=1
-    LISTEN_LINES=$(ss -tulnH 2>/dev/null | awk '$1=="LISTEN" || $1=="UNCONN"')
+    # With -t -u combined, ss prefixes each line with a Netid column
+    # (tcp/udp), so the state may be $1 (single protocol) or $2 (mixed).
+    LISTEN_LINES=$(ss -tulnH 2>/dev/null | awk '$1=="LISTEN"||$1=="UNCONN"||$2=="LISTEN"||$2=="UNCONN"')
 elif command -v netstat >/dev/null 2>&1; then
     PORT_TOOLS_OK=1
     LISTEN_LINES=$(netstat -tuln 2>/dev/null | awk '$6=="LISTEN"')
@@ -551,7 +557,9 @@ else
     if [ -n "$LISTEN_LINES" ]; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            local_addr=$(echo "$line" | awk '{print $4}')
+            # The local address is $4 without Netid, or $5 with it; match
+            # the first host:port-shaped field instead of a fixed column.
+            local_addr=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if ($i ~ /^(\[[^]]*\])?[^: ]*:[0-9]+$/) {print $i; exit}}')
             [ -z "$local_addr" ] && continue
             port=$(echo "$local_addr" | awk -F: '{print $NF}')
             case "$port" in
@@ -651,7 +659,7 @@ fi
 
 # Check for suspicious SUID files (v0.3: fast scan)
 COMMON_SUID_PATHS='^/usr/bin/|^/bin/|^/sbin/|^/usr/sbin/|^/usr/lib|^/usr/libexec'
-KNOWN_SUID_BINS='ping$|sudo$|mount$|umount$|su$|passwd$|chsh$|newgrp$|gpasswd$|chfn$'
+KNOWN_SUID_BINS='ping$|sudo$|mount$|umount$|su$|passwd$|chsh$|newgrp$|gpasswd$|chfn$|ssh-keysign$'
 
 echo -e "\n${GRAY}Checking SUID files (fast scan)...${NC}"
 SUID_FILES=$(timeout 180 find / -xdev \
